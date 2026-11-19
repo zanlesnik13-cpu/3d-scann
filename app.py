@@ -1148,17 +1148,22 @@ def _generate_report_txt(
     lines.append("1. UPORABLJENI FILTRI PREDOBDELAVE")
     lines.append(sep_minor)
     if prep_info:
-        xr = prep_info["x_range"]
-        yr = prep_info["y_range"]
-        zr = prep_info["z_range"]
-        lines.append(
-            f"  Grobi izrez (Bounding Box): "
-            f"X=[{xr[0]:.3f}, {xr[1]:.3f}] m, "
-            f"Y=[{yr[0]:.3f}, {yr[1]:.3f}] m, "
-            f"Z=[{zr[0]:.3f}, {zr[1]:.3f}] m "
-            f"(odstranjenih: {format_int_sl(prep_info['crop_removed'])})"
-        )
-        if prep_info["use_sor"]:
+        if prep_info.get("cropped_externally"):
+            lines.append(
+                "  Grobi izrez (Bounding Box): Izveden predhodno v CloudCompare (uvožen obrezan element)"
+            )
+        elif "x_range" in prep_info:
+            xr = prep_info["x_range"]
+            yr = prep_info["y_range"]
+            zr = prep_info["z_range"]
+            lines.append(
+                f"  Grobi izrez (Bounding Box): "
+                f"X=[{xr[0]:.3f}, {xr[1]:.3f}] m, "
+                f"Y=[{yr[0]:.3f}, {yr[1]:.3f}] m, "
+                f"Z=[{zr[0]:.3f}, {zr[1]:.3f}] m "
+                f"(odstranjenih: {format_int_sl(prep_info['crop_removed'])})"
+            )
+        if prep_info.get("use_sor"):
             lines.append(
                 f"  SOR filter:                 AKTIVEN "
                 f"(k={prep_info['sor_k']}, std_ratio={prep_info['sor_std']:.2f}, "
@@ -1167,7 +1172,7 @@ def _generate_report_txt(
         else:
             lines.append("  SOR filter:                 Izklopljen")
 
-        if prep_info["use_dbscan"]:
+        if prep_info.get("use_dbscan"):
             lines.append(
                 f"  DBSCAN izolacija objekta:   AKTIVNA "
                 f"(eps={prep_info['dbscan_eps']:.3f} m, "
@@ -1177,7 +1182,7 @@ def _generate_report_txt(
         else:
             lines.append("  DBSCAN izolacija objekta:   Izklopljena")
 
-        rmode = prep_info["resample_mode"]
+        rmode = prep_info.get("resample_mode", "Brez redčenja")
         if rmode == "Voxel":
             lines.append(f"  Redčenje oblaka:            Voxel (voxel_size={prep_info['voxel_size']:.4f} m)")
         elif rmode == "Target count":
@@ -1532,15 +1537,563 @@ def _render_tab_adjustment(
         )
 
 
+# ---------------------------------------------------------------------------
+# Zavihek 0 (prvi zavihek): Hitra obdelava obrezanih elementov (.txt)
+# ---------------------------------------------------------------------------
+
+
+def _detect_model_from_filename(filename: str) -> tuple[str, bool]:
+    """Iz imena datoteke samodejno zazna predizbrani tip geometrijskega telesa.
+
+    Vrne ``(model_name, was_auto_detected)``.
+    """
+    stem = (
+        Path(filename)
+        .stem.lower()
+        .replace("č", "c")
+        .replace("š", "s")
+        .replace("ž", "z")
+        .replace("ć", "c")
+        .replace("đ", "d")
+    )
+    if "krogla" in stem or "sphere" in stem:
+        return "Krogla", True
+    if "valj" in stem or "cyl" in stem:
+        return "Pokončni valj", True
+    if "stozec" in stem or "cone" in stem:
+        return "Pokončni stožec", True
+    if "ravnin" in stem or "plane" in stem or "plosk" in stem:
+        return "Ravnina", True
+    return "Krogla", False
+
+
+def _on_quick_model_change() -> None:
+    """Ob izbiri modela 'Pokončni stožec' samodejno obkljuka 2.5D izračun volumna."""
+    selected_model = st.session_state.get("quick_model", "Krogla")
+    st.session_state["quick_calc_volume"] = selected_model == "Pokončni stožec"
+
+
+def _sync_quick_element_widgets(
+    element_id: str,
+    filename: str,
+    raw_points: np.ndarray,
+) -> bool:
+    """Sinhronizira privzete nastavitve ob preklopu na drug obrezan element."""
+    detected_model, was_detected = _detect_model_from_filename(filename)
+
+    if st.session_state.get("quick_active_element_id") != element_id:
+        st.session_state["quick_active_element_id"] = element_id
+        st.session_state["quick_model"] = detected_model
+        st.session_state["quick_use_sor"] = True
+        st.session_state["quick_sor_k"] = 20
+        st.session_state["quick_sor_std"] = 2.0
+        st.session_state["quick_use_voxel"] = False
+        st.session_state["quick_voxel_size"] = 0.005
+        st.session_state["quick_outlier_3sigma"] = True
+        st.session_state["quick_calc_volume"] = detected_model == "Pokončni stožec"
+        st.session_state["quick_ground_z"] = float(raw_points[:, 2].min())
+        st.session_state["quick_grid_step"] = 0.01
+
+    return was_detected
+
+
+def _render_tab_quick_elements(
+    use_local_center: bool,
+    marker_size: float,
+) -> None:
+    """Izriše prvi zavihek: Hitra obdelava obrezanih elementov (.txt) iz CloudCompare."""
+    st.subheader("Hitra obdelava obrezanih elementov (.txt)")
+    st.caption(
+        "Naložite posamezne v CloudCompare že obrezane geometrijske elemente "
+        "(npr. `krogla.txt`, `valj.txt`, `stozec.txt`, `ravnina.txt`) in z enim klikom "
+        "izvedite čiščenje, MNK izravnavo, opcijski 2.5D volumen ter izvoz poročila."
+    )
+
+    # 1. Nalaganje ene ali več datotek (.txt / .pts) ali izbira iz lokalne mape data/
+    quick_source = st.radio(
+        "Vir obrezanih elementov:",
+        options=("Naloži datoteke (.txt / .pts)", "Izberi iz lokalne mape data/"),
+        horizontal=True,
+        key="quick_source_mode",
+    )
+
+    loaded_elements: list[dict[str, Any]] = []
+
+    if quick_source == "Naloži datoteke (.txt / .pts)":
+        uploaded_files = st.file_uploader(
+            "Naložite eno ali več datotek obrezanih elementov iz CloudCompare (.txt, .pts)",
+            type=["txt", "pts", "csv", "las", "laz"],
+            accept_multiple_files=True,
+            key="quick_file_uploader",
+            help=(
+                "Podprti so CloudCompare izvozi z glavo `//X Y Z ...`, `.pts` in ostali formati. "
+                "Vse koordinate se berejo v `np.float64`."
+            ),
+        )
+        if uploaded_files:
+            for uf in uploaded_files:
+                try:
+                    raw_bytes = uf.getvalue()
+                    pts = load_uploaded_cloud_cached(raw_bytes, uf.name)
+                    digest = hashlib.md5(raw_bytes).hexdigest()
+                    loaded_elements.append(
+                        {
+                            "id": f"quick_upload::{uf.name}::{len(raw_bytes)}::{digest}",
+                            "name": uf.name,
+                            "points": pts,
+                        }
+                    )
+                except Exception as exc:
+                    st.error(f"Napaka pri branju datoteke `{uf.name}`: {exc}")
+    else:
+        local_files = list_local_point_clouds(DATA_DIR)
+        if not local_files:
+            st.info(
+                "Mapa `data/` trenutno ne vsebuje podprtih datotek "
+                "(`.txt`, `.pts`, `.csv`, `.las`, `.laz`). "
+                "Naložite datoteke zgoraj ali jih dodajte v mapo `data/`."
+            )
+        else:
+            selected_paths = st.multiselect(
+                "Izberite eno ali več datotek iz mape data/:",
+                options=local_files,
+                default=local_files,
+                format_func=lambda p: p.name,
+                key="quick_local_multiselect",
+            )
+            for path in selected_paths:
+                try:
+                    stat = path.stat()
+                    pts = load_local_cloud_cached(str(path), stat.st_mtime_ns, stat.st_size)
+                    loaded_elements.append(
+                        {
+                            "id": f"quick_local::{path.resolve()}::{stat.st_mtime_ns}::{stat.st_size}",
+                            "name": path.name,
+                            "points": pts,
+                        }
+                    )
+                except Exception as exc:
+                    st.error(f"Napaka pri branju lokalne datoteke `{path.name}`: {exc}")
+
+    if not loaded_elements:
+        st.info(
+            "Za začetek naložite eno ali več obrezanih `.txt` / `.pts` datotek iz CloudCompare "
+            "(npr. `krogla.txt`, `valj.txt`, `stozec.txt`, `ravnina.txt`)."
+        )
+        return
+
+    # Izbirnik aktivnega elementa na vrhu (kadar je naloženih več datotek)
+    if len(loaded_elements) > 1:
+        elem_names = [e["name"] for e in loaded_elements]
+        selected_idx = st.selectbox(
+            f"Izberite element za pregled in obdelavo (naloženih: {len(loaded_elements)}):",
+            options=list(range(len(loaded_elements))),
+            format_func=lambda idx: elem_names[idx],
+            key="quick_selected_element_idx",
+        )
+        active_elem = loaded_elements[selected_idx]
+    else:
+        active_elem = loaded_elements[0]
+
+    elem_id: str = active_elem["id"]
+    elem_name: str = active_elem["name"]
+    raw_pts: np.ndarray = active_elem["points"]
+
+    was_auto_detected = _sync_quick_element_widgets(elem_id, elem_name, raw_pts)
+
+    # Osnovni podatki o naloženem obrezanem oblaku
+    raw_min = raw_pts.min(axis=0)
+    raw_max = raw_pts.max(axis=0)
+    raw_dims = raw_max - raw_min
+    raw_center = 0.5 * (raw_min + raw_max)
+
+    st.markdown(f"#### Obrezan element: `{elem_name}`")
+    info_c1, info_c2, info_c3, info_c4 = st.columns(4)
+    info_c1.metric("Število točk (uvoženo)", format_int_sl(int(raw_pts.shape[0])))
+    info_c2.metric("Box dX", f"{raw_dims[0]:.4f} m")
+    info_c3.metric("Box dY", f"{raw_dims[1]:.4f} m")
+    info_c4.metric("Box dZ", f"{raw_dims[2]:.4f} m")
+
+    ctr_c1, ctr_c2, ctr_c3 = st.columns(3)
+    ctr_c1.metric("Središče X", f"{raw_center[0]:.4f} m")
+    ctr_c2.metric("Središče Y", f"{raw_center[1]:.4f} m")
+    ctr_c3.metric("Središče Z", f"{raw_center[2]:.4f} m")
+
+    # 2. Nastavitve in gumb "Izvedi celotno obdelavo"
+    st.markdown("#### Nastavitve hitre obdelave")
+    model_col, hint_col = st.columns([2, 3])
+    with model_col:
+        model_choice = st.selectbox(
+            "Tip geometrijskega telesa",
+            options=tuple(ADJUSTMENT_MODELS.keys()),
+            key="quick_model",
+            on_change=_on_quick_model_change,
+        )
+    with hint_col:
+        st.write("")
+        if was_auto_detected:
+            st.caption(
+                f"Tip telesa je bil samodejno predizbran iz imena datoteke `{elem_name}`."
+            )
+        else:
+            st.caption(
+                "Tip telesa lahko kadarkoli spremenite (imena z `krogla`, `valj`, `stozec`, "
+                "`ravnina` se zaznajo samodejno)."
+            )
+
+    opt_c1, opt_c2 = st.columns(2)
+    with opt_c1:
+        use_sor = st.checkbox(
+            "Odstrani osamelce (SOR filter)",
+            key="quick_use_sor",
+        )
+        sor_sub1, sor_sub2 = st.columns(2)
+        with sor_sub1:
+            sor_k = int(
+                st.number_input(
+                    "SOR sosedi (k)",
+                    min_value=2,
+                    max_value=200,
+                    step=1,
+                    key="quick_sor_k",
+                    disabled=not use_sor,
+                )
+            )
+        with sor_sub2:
+            sor_std = float(
+                st.number_input(
+                    "SOR std_ratio",
+                    min_value=0.1,
+                    max_value=10.0,
+                    step=0.1,
+                    format="%.2f",
+                    key="quick_sor_std",
+                    disabled=not use_sor,
+                )
+            )
+
+        use_voxel = st.checkbox(
+            "Razredči oblak (Voxel resample)",
+            key="quick_use_voxel",
+        )
+        voxel_size = float(
+            st.number_input(
+                "Velikost voksla [m]",
+                min_value=0.0005,
+                max_value=2.0,
+                step=0.001,
+                format="%.4f",
+                key="quick_voxel_size",
+                disabled=not use_voxel,
+            )
+        )
+
+    with opt_c2:
+        outlier_3sigma = st.checkbox(
+            "Izloči grobe napake > 3 * sigma0 in ponovi izravnavo po MNK",
+            key="quick_outlier_3sigma",
+        )
+        calc_volume = st.checkbox(
+            "Izračunaj tudi 2.5D volumen",
+            key="quick_calc_volume",
+            help="Samodejno obkljukano za 'Pokončni stožec'.",
+        )
+        vol_sub1, vol_sub2 = st.columns(2)
+        with vol_sub1:
+            ground_z = float(
+                st.number_input(
+                    "Referenčna višina ground_z [m]",
+                    step=0.005,
+                    format="%.4f",
+                    key="quick_ground_z",
+                    disabled=not calc_volume,
+                )
+            )
+        with vol_sub2:
+            grid_step = float(
+                st.number_input(
+                    "Korak mreže grid_step [m]",
+                    min_value=0.001,
+                    max_value=5.0,
+                    step=0.005,
+                    format="%.4f",
+                    key="quick_grid_step",
+                    disabled=not calc_volume,
+                )
+            )
+
+    run_quick = st.button("Izvedi celotno obdelavo", type="primary", key="quick_run_button")
+
+    quick_store: dict[str, dict[str, Any]] = st.session_state.setdefault("quick_results", {})
+
+    if run_quick:
+        try:
+            with st.spinner(f"Izvajanje celotne obdelave za `{elem_name}` ({model_choice}) ..."):
+                current = raw_pts
+                sor_removed = 0
+                if use_sor and current.shape[0] > 1:
+                    current, sor_removed = statistical_outlier_removal(
+                        current,
+                        k_neighbors=sor_k,
+                        std_ratio=sor_std,
+                    )
+                after_sor = int(current.shape[0])
+
+                if use_voxel and current.shape[0] > 0:
+                    current = resample_cloud(
+                        current,
+                        method="voxel",
+                        voxel_size=voxel_size,
+                    )
+                cleaned_pts = current
+
+                fit_fn = ADJUSTMENT_MODELS[model_choice]
+                res_first = fit_fn(cleaned_pts)
+                points_used = cleaned_pts
+                final_res = res_first
+                rejected_3sigma = 0
+                first_pass_sigma0 = res_first.sigma0
+
+                if outlier_3sigma and res_first.sigma0 > 0.0:
+                    inlier_mask = np.abs(res_first.residuals) <= 3.0 * res_first.sigma0
+                    rejected_3sigma = int(cleaned_pts.shape[0] - np.count_nonzero(inlier_mask))
+                    if rejected_3sigma > 0:
+                        if int(np.count_nonzero(inlier_mask)) <= res_first.n_unknowns:
+                            st.warning(
+                                "Izločanje > 3·σ₀ bi pustilo premalo točk za ponovitev izravnave; "
+                                "ohranjen je rezultat prve izravnave."
+                            )
+                            rejected_3sigma = 0
+                        else:
+                            points_used = np.ascontiguousarray(
+                                cleaned_pts[inlier_mask], dtype=np.float64
+                            )
+                            final_res = fit_fn(points_used)
+
+                vol_results: dict[str, Any] | None = None
+                vol_z_matrix: np.ndarray | None = None
+                if calc_volume:
+                    vol_results, vol_z_matrix = compute_25d_volume(
+                        points_used,
+                        ground_z=ground_z,
+                        grid_step=grid_step,
+                    )
+
+                prep_info = {
+                    "cropped_externally": True,
+                    "raw_count": int(raw_pts.shape[0]),
+                    "processed_count": int(cleaned_pts.shape[0]),
+                    "use_sor": use_sor,
+                    "sor_k": sor_k,
+                    "sor_std": sor_std,
+                    "sor_removed": sor_removed,
+                    "after_sor": after_sor,
+                    "use_dbscan": False,
+                    "resample_mode": "Voxel" if use_voxel else "Brez redčenja",
+                    "voxel_size": voxel_size,
+                    "target_count": int(cleaned_pts.shape[0]),
+                }
+
+                adj_output = {
+                    "result": final_res,
+                    "points_used": points_used,
+                    "model_choice": model_choice,
+                    "outlier_3sigma_enabled": outlier_3sigma,
+                    "rejected_3sigma": rejected_3sigma,
+                    "first_pass_sigma0": first_pass_sigma0,
+                }
+
+                quick_store[elem_id] = {
+                    "elem_name": elem_name,
+                    "prep_info": prep_info,
+                    "adj_output": adj_output,
+                    "vol_results": vol_results,
+                    "vol_z_matrix": vol_z_matrix,
+                }
+        except ValueError as exc:
+            st.error(f"Obdelava ni uspela: {exc}")
+            return
+
+    bundle = quick_store.get(elem_id)
+    if bundle is None:
+        st.info(
+            "Preverite izbrani tip geometrijskega telesa in kliknite "
+            "**Izvedi celotno obdelavo** za zagon čiščenja, MNK izravnave in vizualizacije."
+        )
+        return
+
+    # 3. Prikaz rezultatov celotne obdelave
+    st.divider()
+    prep_info = bundle["prep_info"]
+    adj_output = bundle["adj_output"]
+    result: AdjustmentResult = adj_output["result"]
+    points_used: np.ndarray = adj_output["points_used"]
+    vol_results: dict[str, Any] | None = bundle["vol_results"]
+    vol_z_matrix: np.ndarray | None = bundle["vol_z_matrix"]
+
+    st.markdown(f"### Rezultati obdelave: `{elem_name}` ({result.model_name})")
+
+    if not result.converged:
+        st.warning(
+            f"Izravnava po {result.iterations} iteracijah ni dosegla predpisane tolerance."
+        )
+
+    clean_summary_parts = [f"Uvoženih: **{format_int_sl(prep_info['raw_count'])}**"]
+    if prep_info["use_sor"]:
+        clean_summary_parts.append(f"SOR odstranil: **{format_int_sl(prep_info['sor_removed'])}**")
+    if prep_info["resample_mode"] == "Voxel":
+        clean_summary_parts.append(
+            f"Po Voxel ({prep_info['voxel_size']:.4f} m): **{format_int_sl(prep_info['processed_count'])}**"
+        )
+    if adj_output["outlier_3sigma_enabled"]:
+        clean_summary_parts.append(
+            f"Izločenih > 3·σ₀: **{format_int_sl(adj_output['rejected_3sigma'])}**"
+        )
+    clean_summary_parts.append(f"Končnih v MNK: **{format_int_sl(result.n_points)}**")
+    st.caption(" | ".join(clean_summary_parts))
+
+    # Metrike MNK
+    qm1, qm2, qm3, qm4, qm5 = st.columns(5)
+    qm1.metric(
+        "σ₀ (aposteriorni)",
+        f"{result.sigma0 * 1000.0:.3f} mm",
+        delta=f"{result.sigma0:.6f} m",
+        delta_color="off",
+    )
+    qm2.metric(
+        "RMSE odstopanj",
+        f"{result.rmse * 1000.0:.3f} mm",
+        delta=f"min {result.min_residual * 1000.0:+.2f} / max {result.max_residual * 1000.0:+.2f} mm",
+        delta_color="off",
+    )
+    qm3.metric("Število točk (n)", format_int_sl(result.n_points))
+    qm4.metric(
+        "Prostostne stopnje (n - u)",
+        format_int_sl(result.degrees_of_freedom),
+        delta=f"u = {result.n_unknowns}",
+        delta_color="off",
+    )
+    qm5.metric(
+        "Število iteracij",
+        f"{result.iterations}",
+        delta="Konvergiralo" if result.converged else "Ni konvergiralo",
+        delta_color="off",
+    )
+
+    # Tabela parametrov + kofaktorska matrika
+    st.markdown("#### Izravnani parametri modela")
+    st.dataframe(_build_params_dataframe(result), width="stretch", hide_index=True)
+
+    with st.expander("Kofaktorska matrika Q_ΔΔ", expanded=False):
+        q_labels = _get_qdd_labels(result)
+        q_df = pd.DataFrame(
+            [[f"{val:.6e}" for val in row] for row in result.Q_dd],
+            index=q_labels,
+            columns=q_labels,
+        )
+        st.dataframe(q_df, width="stretch")
+        if result.model_name == "Ravnina" and "fixed_axis" in result.extra:
+            st.caption(
+                f"Pri ravnini je bila fiksirana komponenta normale po osi "
+                f"`{result.extra['fixed_axis']}` = 1.0."
+            )
+
+    # Opcijski 2.5D volumen in 2D heatmap
+    if vol_results is not None and vol_z_matrix is not None:
+        st.markdown("#### Izračun 2.5D volumna")
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric("Skupni volumen [m³]", f"{vol_results['volume_m3']:.6f} m³")
+        vc2.metric("Skupni volumen [dm³ / L]", f"{vol_results['volume_dm3']:.3f} dm³")
+        vc3.metric("Površina tlorisa [m²]", f"{vol_results['surface_area_m2']:.4f} m²")
+        vc4.metric(
+            "Dodani / odvzeti volumen",
+            f"+{vol_results['added_volume_dm3']:.2f} / -{vol_results['removed_volume_dm3']:.2f} dm³",
+        )
+        fig_qheat, was_h_down = build_volume_heatmap(
+            vol_z_matrix,
+            vol_results["x_coords"],
+            vol_results["y_coords"],
+            ground_z=vol_results["ground_z"],
+            relative_height=False,
+        )
+        if was_h_down:
+            st.info(
+                "Toplotni zemljevid je pomanjšan za odziven prikaz; volumen je izračunan na polni mreži."
+            )
+        st.plotly_chart(fig_qheat, width="stretch")
+
+    # 3D Plotly graf: točke po odstopanjih + polprosojna ploskev
+    st.markdown("#### 3D prikaz odstopanj in izravnane ploskve")
+    fig_q3d, was_sub = build_adjustment_3d_figure(
+        points_used,
+        result,
+        use_local_center=use_local_center,
+        marker_size=marker_size,
+    )
+    if was_sub:
+        st.info(
+            f"Za odziven 3D izris je prikazan naključni podvzorec **{format_int_sl(MAX_PLOT_POINTS)}** "
+            f"od **{format_int_sl(result.n_points)}** točk. Vsi izračuni temeljijo na vseh točkah."
+        )
+    st.plotly_chart(fig_q3d, width="stretch")
+
+    # Histogram odstopanj
+    st.markdown("#### Histogram odstopanj (rezidualov)")
+    st.plotly_chart(build_residuals_histogram(result), width="stretch")
+
+    # 4. Izvoz za poročilo
+    st.markdown("#### Izvoz poročila za ta element")
+    stem = Path(elem_name).stem
+    model_slug = (
+        result.model_name.lower()
+        .replace(" ", "_")
+        .replace("č", "c")
+        .replace("ž", "z")
+        .replace("š", "s")
+    )
+    vol_for_report = (
+        {k: v for k, v in vol_results.items() if k not in ("x_coords", "y_coords")}
+        if vol_results is not None
+        else None
+    )
+    report_bytes = _generate_report_txt(
+        source_name=elem_name,
+        prep_info=prep_info,
+        volume_results=vol_for_report,
+        adj_output=adj_output,
+    )
+    csv_bytes = _generate_residuals_csv(points_used, result.residuals)
+
+    qdl1, qdl2 = st.columns(2)
+    with qdl1:
+        st.download_button(
+            label="Prenesi poročilo za ta element (.txt)",
+            data=report_bytes,
+            file_name=f"{stem}_porocilo_{model_slug}.txt",
+            mime="text/plain",
+            width="stretch",
+            key=f"quick_dl_report_{elem_id}",
+        )
+    with qdl2:
+        st.download_button(
+            label="Prenesi odstopanja (.csv)",
+            data=csv_bytes,
+            file_name=f"{stem}_odstopanja_{model_slug}.csv",
+            mime="text/csv",
+            width="stretch",
+            key=f"quick_dl_csv_{elem_id}",
+        )
+
+
 def main() -> None:
     """Glavna vstopna točka Streamlit uporabniškega vmesnika."""
     st.title("GMS Vaja 2 – Obdelava oblaka točk")
     st.caption(
-        "Predogled, predobdelava (CloudCompare orodja), 2.5D volumetrija in geodetska "
-        "izravnava po MNK za oblake točk Leica MS60 / Leica Infinity."
+        "Hitra obdelava obrezanih elementov ter celotna predobdelava (CloudCompare orodja), "
+        "2.5D volumetrija in geodetska izravnava po MNK za Leica MS60 / Leica Infinity."
     )
 
-    st.sidebar.header("1. Vir podatkov")
+    st.sidebar.header("1. Vir surovega oblaka (za ročno obdelavo)")
     source_mode = st.sidebar.radio(
         "Izberite način nalaganja:",
         options=("Lokalna mapa data/", "Naloži datoteko"),
@@ -1593,26 +2146,28 @@ def main() -> None:
             except Exception as exc:
                 st.error(f"Napaka pri branju naložene datoteke `{uploaded_file.name}`: {exc}")
 
-    if points is None or source_id is None or active_source_name is None:
+    has_sidebar_cloud = (
+        points is not None and source_id is not None and active_source_name is not None
+    )
+
+    if has_sidebar_cloud:
+        assert points is not None and source_id is not None and active_source_name is not None
+        x_bounds, y_bounds, z_bounds = _sync_session_state_for_source(
+            source_id=source_id,
+            source_name=active_source_name,
+            raw_points=points,
+        )
+    else:
         st.session_state.pop("active_source_id", None)
         st.session_state.pop("raw_points", None)
         st.session_state.pop("processed_points", None)
         st.session_state.pop("adjustment_output", None)
         st.session_state.pop("volume_results", None)
         st.session_state.pop("preprocessing_info", None)
-        st.info(
-            "Za začetek izberite oblak točk iz mape `data/` ali pa v stranski vrstici "
-            "naložite datoteko (`.pts`, `.las`, `.laz`, `.txt`, `.csv`)."
-        )
-        return
+        if "use_local_center" not in st.session_state:
+            st.session_state["use_local_center"] = True
 
-    x_bounds, y_bounds, z_bounds = _sync_session_state_for_source(
-        source_id=source_id,
-        source_name=active_source_name,
-        raw_points=points,
-    )
-
-    # Nastavitve 3D prikaza v stranski vrstici
+    # Nastavitve 3D prikaza v stranski vrstici (veljajo za vse zavihke)
     st.sidebar.divider()
     st.sidebar.header("Nastavitve 3D prikaza")
     use_local_center = st.sidebar.checkbox(
@@ -1632,13 +2187,37 @@ def main() -> None:
         step=0.5,
     )
 
-    tab1, tab2, tab3 = st.tabs(
+    tab_quick, tab1, tab2, tab3 = st.tabs(
         [
+            "Hitra obdelava obrezanih elementov (.txt)",
             "Pregled in predobdelava (CloudCompare)",
             "Izračun volumna (2.5D)",
             "Izravnava po MNK",
         ]
     )
+
+    with tab_quick:
+        _render_tab_quick_elements(
+            use_local_center=use_local_center,
+            marker_size=marker_size,
+        )
+
+    if not has_sidebar_cloud:
+        sidebar_prompt = (
+            "Za ročno obrezovanje in korak-po-koraku obdelavo v stranski vrstici izberite "
+            "surovi oblak točk iz mape `data/` ali naložite datoteko (`.pts`, `.las`, `.laz`, `.txt`, `.csv`). "
+            "Če že imate obrezane elemente iz CloudCompare, uporabite prvi zavihek "
+            "**Hitra obdelava obrezanih elementov (.txt)**."
+        )
+        with tab1:
+            st.info(sidebar_prompt)
+        with tab2:
+            st.info(sidebar_prompt)
+        with tab3:
+            st.info(sidebar_prompt)
+        return
+
+    assert points is not None and source_id is not None and active_source_name is not None
 
     with tab1:
         processed_points, processed_sig = _render_tab_preprocessing(
