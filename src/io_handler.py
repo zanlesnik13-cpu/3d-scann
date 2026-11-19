@@ -314,10 +314,10 @@ def load_point_cloud_from_bytes(data: bytes, filename: str) -> np.ndarray:
     return _read_ascii_from_text_buffer(io.StringIO(text))
 
 
-def save_point_cloud_txt(points: np.ndarray, filepath: str | Path) -> Path:
-    """Shrani očiščen oblak točk ``(N, 3)`` v ``.txt`` format s 6 decimalnimi mesti.
+def point_cloud_to_txt_bytes(points: np.ndarray) -> bytes:
+    """Pretvori oblak točk ``(N, 3)`` v bajte ``.txt`` zapisa s 6 decimalnimi mesti.
 
-    Uporablja ločilo presledek in natančnost ``%.6f``, primerno za geodetske koordinate.
+    Uporablja ločilo presledek in natančnost ``%.6f``, enako kot ``save_point_cloud_txt``.
     """
     raw = np.asarray(points, dtype=np.float64)
     if raw.ndim != 2 or raw.shape[1] < 3:
@@ -325,7 +325,18 @@ def save_point_cloud_txt(points: np.ndarray, filepath: str | Path) -> Path:
             f"Pričakovana 2D tabela z vsaj 3 stolpci (X, Y, Z), dobljena pa oblika {raw.shape}."
         )
     arr = _validate_points_array(raw[:, :3])
+    buffer = io.BytesIO()
+    np.savetxt(buffer, arr, fmt="%.6f", delimiter=" ")
+    return buffer.getvalue()
+
+
+def save_point_cloud_txt(points: np.ndarray, filepath: str | Path) -> Path:
+    """Shrani očiščen oblak točk ``(N, 3)`` v ``.txt`` format s 6 decimalnimi mesti.
+
+    Uporablja ločilo presledek in natančnost ``%.6f``, primerno za geodetske koordinate.
+    """
+    txt_bytes = point_cloud_to_txt_bytes(points)
     out_path = Path(filepath)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savetxt(out_path, arr, fmt="%.6f", delimiter=" ")
+    out_path.write_bytes(txt_bytes)
     return out_path
