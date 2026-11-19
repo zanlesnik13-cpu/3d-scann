@@ -6,7 +6,9 @@ in izvoženih iz programske opreme Leica Infinity.
 
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
+import io
 import math
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.adjustment import (
+    AdjustmentResult,
+    fit_cone_vertical,
+    fit_cylinder_vertical,
+    fit_plane,
+    fit_sphere,
+)
 from src.io_handler import (
     list_local_point_clouds,
     load_point_cloud,
@@ -209,6 +218,9 @@ def _sync_session_state_for_source(
         st.session_state["use_local_center"] = bool(
             np.max(np.abs(center)) > LARGE_COORD_THRESHOLD
         )
+        st.session_state.pop("adjustment_output", None)
+        st.session_state.pop("volume_results", None)
+        st.session_state.pop("preprocessing_info", None)
     else:
         st.session_state["raw_points"] = raw_points
         st.session_state["active_source_name"] = source_name
@@ -511,8 +523,27 @@ def _render_tab_preprocessing(
         target_count=target_count,
     )
 
-    # Shranimo očiščen oblak v session_state za naslednje zavihke
+    # Shranimo očiščen oblak in povzetek filtrov v session_state za naslednje zavihke in poročilo
     st.session_state["processed_points"] = processed_points
+    st.session_state["preprocessing_info"] = {
+        "raw_count": stats["raw_count"],
+        "processed_count": stats["after_resample"],
+        "x_range": x_range,
+        "y_range": y_range,
+        "z_range": z_range,
+        "crop_removed": stats["raw_count"] - stats["after_crop"],
+        "use_sor": use_sor,
+        "sor_k": sor_k,
+        "sor_std": sor_std,
+        "sor_removed": stats["sor_removed"],
+        "use_dbscan": use_dbscan,
+        "dbscan_eps": dbscan_eps,
+        "dbscan_min_samples": dbscan_min_samples,
+        "dbscan_removed": stats["after_sor"] - stats["after_dbscan"],
+        "resample_mode": resample_mode,
+        "voxel_size": voxel_size,
+        "target_count": target_count,
+    }
 
     processed_sig = (
         source_id,
@@ -743,8 +774,14 @@ def _render_tab_volume(
             grid_step=grid_step,
         )
     except ValueError as exc:
+        st.session_state["volume_results"] = None
         st.warning(str(exc))
         return
+
+    # Shranimo rezultat volumna za samodejno vključitev v končno poročilo
+    st.session_state["volume_results"] = {
+        k: v for k, v in results.items() if k not in ("x_coords", "y_coords")
+    }
 
     # Glavne metrike volumna in površine
     v_col1, v_col2, v_col3, v_col4 = st.columns(4)
@@ -788,12 +825,719 @@ def _render_tab_volume(
     st.plotly_chart(fig_heat, width="stretch")
 
 
+# ---------------------------------------------------------------------------
+# Zavihek 3: Pomožne funkcije za MNK izravnavo, 3D ploskve, histogram in poročilo
+# ---------------------------------------------------------------------------
+
+ADJUSTMENT_MODELS = {
+    "Krogla": fit_sphere,
+    "Ravnina": fit_plane,
+    "Pokončni valj": fit_cylinder_vertical,
+    "Pokončni stožec": fit_cone_vertical,
+}
+
+_PARAM_META: dict[str, tuple[str, str, bool]] = {
+    "x0": ("Središče / os X₀", "m", True),
+    "y0": ("Središče / os Y₀", "m", True),
+    "z0": ("Središče Z₀", "m", True),
+    "R": ("Polmer R", "m", True),
+    "nx": ("Normala nₓ", "-", False),
+    "ny": ("Normala nᵧ", "-", False),
+    "nz": ("Normala n_z", "-", False),
+    "d": ("Globalni odmik d", "m", True),
+    "d_local": ("Lokalni odmik d_loc (pri težišču)", "m", True),
+    "z_vrh": ("Višina vrha Z_vrh", "m", True),
+    "k": ("Naklon stožca k = tan(α)", "-", False),
+}
+
+
+def _get_qdd_labels(result: AdjustmentResult) -> list[str]:
+    """Vrne imena vrstic/stolpcev kofaktorske matrike Q_dd za izbrani model."""
+    if result.model_name == "Krogla":
+        return ["x0", "y0", "z0", "R"]
+    if result.model_name == "Ravnina":
+        raw_names = result.extra.get("raw_param_names")
+        if raw_names:
+            return list(raw_names)
+        return ["u1", "u2", "d_raw"]
+    if result.model_name == "Pokončni valj":
+        return ["x0", "y0", "R"]
+    if result.model_name == "Pokončni stožec":
+        return ["x0", "y0", "z_vrh", "k"]
+    return [f"u{i + 1}" for i in range(result.n_unknowns)]
+
+
+def _build_params_dataframe(result: AdjustmentResult) -> pd.DataFrame:
+    """Sestavi pregledno tabelo izravnanih parametrov z ocenami natančnosti."""
+    rows: list[dict[str, str]] = []
+    for key, val in result.params.items():
+        std_val = result.param_stds.get(key, float("nan"))
+        label, unit, is_meter = _PARAM_META.get(key, (key, "-", False))
+        rows.append(
+            {
+                "Parameter": f"{label} ({key})",
+                "Izravnana vrednost": f"{val:.6f}",
+                "Enota": unit,
+                "± σ [m / enota]": f"{std_val:.6f}",
+                "± σ [mm]": f"{std_val * 1000.0:.4f} mm" if is_meter else "–",
+            }
+        )
+
+    if result.model_name == "Pokončni stožec" and "alpha_deg" in result.extra:
+        rows.append(
+            {
+                "Parameter": "Polovični kot vrha α",
+                "Izravnana vrednost": f"{result.extra['alpha_deg']:.4f}",
+                "Enota": "°",
+                "± σ [m / enota]": f"{result.extra['sigma_alpha_deg']:.4f}",
+                "± σ [mm]": "–",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _build_fitted_surface_mesh(
+    result: AdjustmentResult,
+    points: np.ndarray,
+    shift: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generira 3D mrežo (Xs, Ys, Zs) izravnanega geometrijskega telesa za ``go.Surface``."""
+    p = result.params
+    model = result.model_name
+
+    if model == "Krogla":
+        u = np.linspace(0.0, 2.0 * np.pi, 60)
+        v = np.linspace(0.0, np.pi, 40)
+        uu, vv = np.meshgrid(u, v)
+        r = p["R"]
+        xs = (p["x0"] - shift[0]) + r * np.cos(uu) * np.sin(vv)
+        ys = (p["y0"] - shift[1]) + r * np.sin(uu) * np.sin(vv)
+        zs = (p["z0"] - shift[2]) + r * np.cos(vv)
+        return xs, ys, zs
+
+    if model == "Ravnina":
+        n_vec = np.array([p["nx"], p["ny"], p["nz"]], dtype=np.float64)
+        n_vec /= np.linalg.norm(n_vec)
+        # Izberi referenčni vektor, ki ni vzporeden z normalo
+        ref = np.array([1.0, 0.0, 0.0]) if abs(n_vec[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(n_vec, ref)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(n_vec, e1)
+
+        centroid = result.extra.get("centroid", np.mean(points, axis=0))
+        d_local = p.get("d_local", float(np.dot(n_vec, centroid) + p["d"]))
+        # Projekcija težišča na izravnano ravnino v lokalnih (zamaknjenih) koordinatah
+        p0_global = centroid - d_local * n_vec
+        p0_plot = p0_global - shift
+
+        rel_pts = points - p0_global
+        s_proj = rel_pts @ e1
+        t_proj = rel_pts @ e2
+
+        s_pad = max(0.05 * float(s_proj.max() - s_proj.min()), 1e-4)
+        t_pad = max(0.05 * float(t_proj.max() - t_proj.min()), 1e-4)
+        s_grid = np.linspace(float(s_proj.min()) - s_pad, float(s_proj.max()) + s_pad, 20)
+        t_grid = np.linspace(float(t_proj.min()) - t_pad, float(t_proj.max()) + t_pad, 20)
+        ss, tt = np.meshgrid(s_grid, t_grid)
+
+        xs = p0_plot[0] + ss * e1[0] + tt * e2[0]
+        ys = p0_plot[1] + ss * e1[1] + tt * e2[1]
+        zs = p0_plot[2] + ss * e1[2] + tt * e2[2]
+        return xs, ys, zs
+
+    if model == "Pokončni valj":
+        theta = np.linspace(0.0, 2.0 * np.pi, 64)
+        z_min = float(points[:, 2].min())
+        z_max = float(points[:, 2].max())
+        if z_max <= z_min:
+            z_max = z_min + 0.1
+        z_vals = np.linspace(z_min, z_max, 25)
+        tt, zz = np.meshgrid(theta, z_vals)
+        r = p["R"]
+        xs = (p["x0"] - shift[0]) + r * np.cos(tt)
+        ys = (p["y0"] - shift[1]) + r * np.sin(tt)
+        zs = zz - shift[2]
+        return xs, ys, zs
+
+    if model == "Pokončni stožec":
+        theta = np.linspace(0.0, 2.0 * np.pi, 64)
+        z_min = float(points[:, 2].min())
+        z_max = float(points[:, 2].max())
+        if z_max <= z_min:
+            z_max = z_min + 0.1
+        z_vals = np.linspace(z_min, z_max, 30)
+        tt, zz = np.meshgrid(theta, z_vals)
+        rr = p["k"] * np.abs(zz - p["z_vrh"])
+        xs = (p["x0"] - shift[0]) + rr * np.cos(tt)
+        ys = (p["y0"] - shift[1]) + rr * np.sin(tt)
+        zs = zz - shift[2]
+        return xs, ys, zs
+
+    raise ValueError(f"Neznan model za 3D izris ploskve: {model}")
+
+
+def build_adjustment_3d_figure(
+    points: np.ndarray,
+    result: AdjustmentResult,
+    *,
+    use_local_center: bool,
+    marker_size: float,
+) -> tuple[go.Figure, bool]:
+    """3D graf oblaka točk (obarvan po rezidualih v mm, RdBu_r) + polprosojna ploskev telesa."""
+    n_points = points.shape[0]
+    was_subsampled = n_points > MAX_PLOT_POINTS
+
+    if was_subsampled:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n_points, size=MAX_PLOT_POINTS, replace=False)
+        pts_plot = points[idx]
+        res_plot_mm = result.residuals[idx] * 1000.0
+    else:
+        pts_plot = points
+        res_plot_mm = result.residuals * 1000.0
+
+    center = 0.5 * (points.min(axis=0) + points.max(axis=0))
+    shift = center if use_local_center else np.zeros(3, dtype=np.float64)
+
+    x_title = "ΔX [m]" if use_local_center else "X [m]"
+    y_title = "ΔY [m]" if use_local_center else "Y [m]"
+    z_title = "ΔZ [m]" if use_local_center else "Z [m]"
+
+    # Simetrična meja barvne lestvice okoli 0 (RdBu_r)
+    clim = float(np.percentile(np.abs(res_plot_mm), 99.5))
+    if clim <= 1e-9:
+        clim = max(float(np.max(np.abs(res_plot_mm))), 1e-3)
+
+    customdata = np.column_stack((pts_plot[:, 0], pts_plot[:, 1], pts_plot[:, 2], res_plot_mm))
+
+    scatter_trace = go.Scatter3d(
+        x=pts_plot[:, 0] - shift[0],
+        y=pts_plot[:, 1] - shift[1],
+        z=pts_plot[:, 2] - shift[2],
+        mode="markers",
+        name="Oblak točk (odstopanja)",
+        customdata=customdata,
+        hovertemplate=(
+            "X: %{customdata[0]:.5f} m<br>"
+            "Y: %{customdata[1]:.5f} m<br>"
+            "Z: %{customdata[2]:.5f} m<br>"
+            "Odstopanje: %{customdata[3]:+.3f} mm"
+            "<extra></extra>"
+        ),
+        marker=dict(
+            size=marker_size,
+            color=res_plot_mm,
+            colorscale="RdBu_r",
+            cmin=-clim,
+            cmax=clim,
+            cmid=0.0,
+            colorbar=dict(title="Odstopanje [mm]"),
+            opacity=0.9,
+        ),
+    )
+
+    xs, ys, zs = _build_fitted_surface_mesh(result, points, shift)
+    surface_trace = go.Surface(
+        x=xs,
+        y=ys,
+        z=zs,
+        opacity=0.35,
+        showscale=False,
+        colorscale=[[0.0, "rgb(31, 119, 180)"], [1.0, "rgb(31, 119, 180)"]],
+        name=f"Izravnana ploskev ({result.model_name})",
+        hoverinfo="skip",
+    )
+
+    fig = go.Figure(data=[scatter_trace, surface_trace])
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=650,
+        legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
+        scene=dict(
+            aspectmode="data",
+            xaxis_title=x_title,
+            yaxis_title=y_title,
+            zaxis_title=z_title,
+        ),
+    )
+    return fig, was_subsampled
+
+
+def build_residuals_histogram(result: AdjustmentResult) -> go.Figure:
+    """Ustvari histogram pravokotnih odstopanj (rezidualov) v milimetrih okoli 0."""
+    res_mm = result.residuals * 1000.0
+    sigma0_mm = result.sigma0 * 1000.0
+
+    fig = px.histogram(
+        x=res_mm,
+        nbins=80,
+        labels={"x": "Pravokotno odstopanje [mm]", "count": "Število točk"},
+        color_discrete_sequence=["#2b6cb0"],
+    )
+    fig.update_layout(
+        yaxis_title="Število točk",
+        xaxis_title="Pravokotno odstopanje [mm]",
+        margin=dict(l=0, r=0, t=25, b=0),
+        height=380,
+        bargap=0.05,
+    )
+    fig.add_vline(x=0.0, line_width=2, line_color="black")
+    if sigma0_mm > 0:
+        fig.add_vline(
+            x=sigma0_mm,
+            line_width=1.5,
+            line_dash="dash",
+            line_color="#d97706",
+            annotation_text="+σ₀",
+            annotation_position="top right",
+        )
+        fig.add_vline(
+            x=-sigma0_mm,
+            line_width=1.5,
+            line_dash="dash",
+            line_color="#d97706",
+            annotation_text="-σ₀",
+            annotation_position="top left",
+        )
+        fig.add_vline(
+            x=3.0 * sigma0_mm,
+            line_width=1.2,
+            line_dash="dot",
+            line_color="#dc2626",
+            annotation_text="+3σ₀",
+            annotation_position="top right",
+        )
+        fig.add_vline(
+            x=-3.0 * sigma0_mm,
+            line_width=1.2,
+            line_dash="dot",
+            line_color="#dc2626",
+            annotation_text="-3σ₀",
+            annotation_position="top left",
+        )
+    return fig
+
+
+def _generate_report_txt(
+    *,
+    source_name: str,
+    prep_info: dict[str, Any] | None,
+    volume_results: dict[str, Any] | None,
+    adj_output: dict[str, Any],
+) -> bytes:
+    """Generira lepo oblikovano slovensko tekstovno poročilo o obdelavi in izravnavi."""
+    result: AdjustmentResult = adj_output["result"]
+    lines: list[str] = []
+    sep_major = "=" * 78
+    sep_minor = "-" * 78
+
+    lines.append(sep_major)
+    lines.append("GMS VAJA 2 – POROČILO O OBDELAVI IN GEODETSKI IZRAVNAVI OBLAKA TOČK")
+    lines.append(sep_major)
+    lines.append(f"Datum in čas izvoza:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Vhodna datoteka:           {source_name}")
+
+    if prep_info:
+        lines.append(f"Število surovih točk:      {format_int_sl(prep_info['raw_count'])}")
+        lines.append(f"Število očiščenih točk:    {format_int_sl(prep_info['processed_count'])}")
+    else:
+        lines.append(f"Število točk v izravnavi:  {format_int_sl(result.n_points)}")
+
+    lines.append("")
+    lines.append("1. UPORABLJENI FILTRI PREDOBDELAVE")
+    lines.append(sep_minor)
+    if prep_info:
+        xr = prep_info["x_range"]
+        yr = prep_info["y_range"]
+        zr = prep_info["z_range"]
+        lines.append(
+            f"  Grobi izrez (Bounding Box): "
+            f"X=[{xr[0]:.3f}, {xr[1]:.3f}] m, "
+            f"Y=[{yr[0]:.3f}, {yr[1]:.3f}] m, "
+            f"Z=[{zr[0]:.3f}, {zr[1]:.3f}] m "
+            f"(odstranjenih: {format_int_sl(prep_info['crop_removed'])})"
+        )
+        if prep_info["use_sor"]:
+            lines.append(
+                f"  SOR filter:                 AKTIVEN "
+                f"(k={prep_info['sor_k']}, std_ratio={prep_info['sor_std']:.2f}, "
+                f"odstranjenih: {format_int_sl(prep_info['sor_removed'])})"
+            )
+        else:
+            lines.append("  SOR filter:                 Izklopljen")
+
+        if prep_info["use_dbscan"]:
+            lines.append(
+                f"  DBSCAN izolacija objekta:   AKTIVNA "
+                f"(eps={prep_info['dbscan_eps']:.3f} m, "
+                f"min_samples={prep_info['dbscan_min_samples']}, "
+                f"odstranjenih: {format_int_sl(prep_info['dbscan_removed'])})"
+            )
+        else:
+            lines.append("  DBSCAN izolacija objekta:   Izklopljena")
+
+        rmode = prep_info["resample_mode"]
+        if rmode == "Voxel":
+            lines.append(f"  Redčenje oblaka:            Voxel (voxel_size={prep_info['voxel_size']:.4f} m)")
+        elif rmode == "Target count":
+            lines.append(
+                f"  Redčenje oblaka:            Naključno (target_count={format_int_sl(prep_info['target_count'])})"
+            )
+        else:
+            lines.append("  Redčenje oblaka:            Brez redčenja")
+    else:
+        lines.append("  Predobdelava ni bila uporabljena (uporabljen surovi oblak).")
+
+    lines.append("")
+    lines.append("2. IZRAČUN VOLUMNA (2.5D)")
+    lines.append(sep_minor)
+    if volume_results:
+        ny, nx = volume_results["grid_shape"]
+        lines.append(f"  Referenčna višina ground_z: {volume_results['ground_z']:.4f} m")
+        lines.append(f"  Korak rastrske mreže:       {volume_results['grid_step']:.4f} m ({nx} × {ny} celic)")
+        lines.append(
+            f"  Skupni neto volumen:        {volume_results['volume_m3']:.6f} m³ "
+            f"({volume_results['volume_dm3']:.3f} dm³ / L)"
+        )
+        lines.append(
+            f"  Dodani volumen (> ground):  {volume_results['added_volume_m3']:.6f} m³ "
+            f"({volume_results['added_volume_dm3']:.3f} dm³)"
+        )
+        lines.append(
+            f"  Odvzeti volumen (< ground): {volume_results['removed_volume_m3']:.6f} m³ "
+            f"({volume_results['removed_volume_dm3']:.3f} dm³)"
+        )
+        lines.append(f"  Površina tlorisa:           {volume_results['surface_area_m2']:.4f} m²")
+        lines.append(
+            f"  Neprazne celice:            "
+            f"{format_int_sl(volume_results['occupied_cells'])} / "
+            f"{format_int_sl(volume_results['total_cells'])}"
+        )
+    else:
+        lines.append("  2.5D volumen ni bil izračunan.")
+
+    lines.append("")
+    lines.append("3. GEODETSKA IZRAVNAVA PO METODI NAJMANJŠIH KVADRATOV (MNK)")
+    lines.append(sep_minor)
+    lines.append(f"  Geometrijski model:         {result.model_name}")
+    lines.append(f"  Konvergenca:                {'DA' if result.converged else 'NE (doseženo max. št. iteracij)'}")
+    lines.append(f"  Število iteracij:           {result.iterations}")
+    lines.append(f"  Število točk (n):           {format_int_sl(result.n_points)}")
+    lines.append(f"  Število neznank (u):        {result.n_unknowns}")
+    lines.append(f"  Prostostne stopnje (n - u): {format_int_sl(result.degrees_of_freedom)}")
+
+    if adj_output.get("outlier_3sigma_enabled"):
+        rejected = adj_output.get("rejected_3sigma", 0)
+        first_s0 = adj_output.get("first_pass_sigma0")
+        if first_s0 is not None:
+            lines.append(
+                f"  Izločanje > 3·σ₀:           AKTIVNO "
+                f"(izločenih {format_int_sl(rejected)} točk, 1. iteracija σ₀={first_s0 * 1000.0:.3f} mm)"
+            )
+    else:
+        lines.append("  Izločanje > 3·σ₀:           Izklopljeno")
+
+    lines.append(
+        f"  Aposteriorni std. odklon:   σ₀ = {result.sigma0:.6f} m ({result.sigma0 * 1000.0:.3f} mm)"
+    )
+
+    lines.append("")
+    lines.append("  Izravnani parametri modela:")
+    lines.append(f"  {'Parameter':<36} {'Vrednost':>15} {'± σ [m/en.]':>14} {'± σ [mm]':>12}")
+    lines.append("  " + "-" * 76)
+    for key, val in result.params.items():
+        std_val = result.param_stds.get(key, float("nan"))
+        label, _, is_meter = _PARAM_META.get(key, (key, "-", False))
+        mm_str = f"{std_val * 1000.0:.4f}" if is_meter else "-"
+        lines.append(
+            f"  {f'{label} ({key})':<36} {val:>15.6f} {std_val:>14.6f} {mm_str:>12}"
+        )
+    if result.model_name == "Pokončni stožec" and "alpha_deg" in result.extra:
+        lines.append(
+            f"  {'Polovični kot vrha α [°]':<36} "
+            f"{result.extra['alpha_deg']:>15.4f} "
+            f"{result.extra['sigma_alpha_deg']:>14.4f} {'-':>12}"
+        )
+
+    mean_res = float(np.mean(result.residuals))
+    std_res = float(np.std(result.residuals))
+    lines.append("")
+    lines.append("  Statistika pravokotnih odstopanj (rezidualov):")
+    lines.append(f"    Min. odstopanje:          {result.min_residual:+.6f} m ({result.min_residual * 1000.0:+.3f} mm)")
+    lines.append(f"    Max. odstopanje:          {result.max_residual:+.6f} m ({result.max_residual * 1000.0:+.3f} mm)")
+    lines.append(f"    Povprečno odstopanje:     {mean_res:+.6f} m ({mean_res * 1000.0:+.4f} mm)")
+    lines.append(f"    Std. odklon odstopanj:    {std_res:.6f} m ({std_res * 1000.0:.3f} mm)")
+    lines.append(f"    RMSE:                     {result.rmse:.6f} m ({result.rmse * 1000.0:.3f} mm)")
+
+    lines.append("")
+    lines.append("  Kofaktorska matrika Q_dd = N^(-1):")
+    q_labels = _get_qdd_labels(result)
+    header_row = "    " + f"{'':<10}" + "".join(f"{lbl:>15}" for lbl in q_labels)
+    lines.append(header_row)
+    for row_lbl, row_vals in zip(q_labels, result.Q_dd):
+        vals_str = "".join(f"{v:>15.6e}" for v in row_vals)
+        lines.append(f"    {row_lbl:<10}{vals_str}")
+
+    if result.model_name == "Ravnina" and "fixed_axis" in result.extra:
+        lines.append(
+            f"  (Opomba: pri izravnavi ravnine je bila za preprečitev singularnosti "
+            f"fiksirana komponenta osi '{result.extra['fixed_axis']}' = 1.0.)"
+        )
+
+    lines.append(sep_major)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _generate_residuals_csv(points: np.ndarray, residuals: np.ndarray) -> bytes:
+    """Generira CSV datoteko s stolpci ``X,Y,Z,odstopanje_m,odstopanje_mm``."""
+    df = pd.DataFrame(
+        {
+            "X": np.round(points[:, 0], 6),
+            "Y": np.round(points[:, 1], 6),
+            "Z": np.round(points[:, 2], 6),
+            "odstopanje_m": np.round(residuals, 6),
+            "odstopanje_mm": np.round(residuals * 1000.0, 4),
+        }
+    )
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, float_format="%.6f")
+    return buf.getvalue().encode("utf-8")
+
+
+def _render_tab_adjustment(
+    source_name: str,
+    processed_sig: tuple[Any, ...],
+    use_local_center: bool,
+    marker_size: float,
+) -> None:
+    """Izriše Zavihek 3: Geodetska izravnava po MNK, 3D ploskev, histogram in izvoz poročila."""
+    st.subheader("Geodetska izravnava po metodi najmanjših kvadratov (MNK)")
+
+    input_points = st.session_state.get("processed_points")
+    if input_points is None:
+        input_points = st.session_state.get("raw_points")
+
+    if input_points is None or input_points.shape[0] == 0:
+        st.warning(
+            "Oblak točk za izravnavo je prazen. V zavihku **Pregled in predobdelava** "
+            "prilagodite filtre, da ostanejo veljavne točke."
+        )
+        return
+
+    st.caption(
+        f"Vhodni oblak za izravnavo: **{format_int_sl(int(input_points.shape[0]))}** točk "
+        f"(`{input_points.dtype}`). Splošni Gauss-Helmertov model: `A·v + B·Δ = f` "
+        f"v lokalnem težiščnem sistemu."
+    )
+
+    # 1. Nastavitve izravnave
+    cfg_col1, cfg_col2 = st.columns([2, 3])
+    with cfg_col1:
+        model_choice = st.selectbox(
+            "Geometrijsko telo",
+            options=tuple(ADJUSTMENT_MODELS.keys()),
+            key="mnk_model_choice",
+        )
+    with cfg_col2:
+        st.write("")
+        outlier_3sigma = st.checkbox(
+            "Avtomatsko izloči točke z odstopanjem > 3 * sigma0 in ponovi izravnavo",
+            key="mnk_outlier_3sigma",
+            help=(
+                "Po prvi izravnavi odstrani vse točke z |odstopanje| > 3·σ₀ "
+                "in izravnavo ponovi na očiščenem naboru."
+            ),
+        )
+
+    run_clicked = st.button("Zaženi izravnavo po MNK", type="primary")
+
+    if run_clicked:
+        fit_fn = ADJUSTMENT_MODELS[model_choice]
+        try:
+            with st.spinner(f"Izvajanje MNK izravnave ({model_choice}) ..."):
+                res_first = fit_fn(input_points)
+                used_points = input_points
+                final_res = res_first
+                rejected_3sigma = 0
+                first_pass_sigma0: float | None = res_first.sigma0
+
+                if outlier_3sigma and res_first.sigma0 > 0.0:
+                    threshold = 3.0 * res_first.sigma0
+                    inlier_mask = np.abs(res_first.residuals) <= threshold
+                    rejected_3sigma = int(input_points.shape[0] - np.count_nonzero(inlier_mask))
+                    if rejected_3sigma > 0:
+                        if int(np.count_nonzero(inlier_mask)) <= res_first.n_unknowns:
+                            st.warning(
+                                "Izločanje > 3·σ₀ bi pustilo premalo točk za ponovitev izravnave; "
+                                "ohranjen je rezultat prve izravnave."
+                            )
+                            rejected_3sigma = 0
+                        else:
+                            used_points = np.ascontiguousarray(
+                                input_points[inlier_mask], dtype=np.float64
+                            )
+                            final_res = fit_fn(used_points)
+
+                st.session_state["adjustment_output"] = {
+                    "result": final_res,
+                    "points_used": used_points,
+                    "processed_sig": processed_sig,
+                    "model_choice": model_choice,
+                    "outlier_3sigma_enabled": outlier_3sigma,
+                    "rejected_3sigma": rejected_3sigma,
+                    "first_pass_sigma0": first_pass_sigma0,
+                }
+        except ValueError as exc:
+            st.error(f"Izravnava ni uspela: {exc}")
+            return
+
+    adj_output = st.session_state.get("adjustment_output")
+    if adj_output is None:
+        st.info(
+            "Izberite geometrijsko telo in kliknite **Zaženi izravnavo po MNK** "
+            "za izračun parametrov, oceno natančnosti in 3D prikaz odstopanj."
+        )
+        return
+
+    if adj_output.get("processed_sig") != processed_sig:
+        st.warning(
+            "Očiščen oblak točk v zavihku 1 se je spremenil po zadnji izravnavi. "
+            "Za posodobljene rezultate ponovno kliknite **Zaženi izravnavo po MNK**."
+        )
+
+    result: AdjustmentResult = adj_output["result"]
+    points_used: np.ndarray = adj_output["points_used"]
+
+    if not result.converged:
+        st.warning(
+            f"Izravnava po {result.iterations} iteracijah ni dosegla predpisane tolerance. "
+            "Preverite ustreznost izbranega geometrijskega modela."
+        )
+
+    if adj_output.get("outlier_3sigma_enabled"):
+        rej = adj_output.get("rejected_3sigma", 0)
+        first_s0 = adj_output.get("first_pass_sigma0", 0.0)
+        if rej > 0:
+            st.info(
+                f"Po prvi izravnavi (σ₀ = {first_s0 * 1000.0:.3f} mm) je bilo avtomatsko "
+                f"izločenih **{format_int_sl(rej)}** grobih napak (|v| > 3·σ₀ = {3.0 * first_s0 * 1000.0:.3f} mm) "
+                f"in izravnava je bila ponovljena na **{format_int_sl(result.n_points)}** točkah."
+            )
+        else:
+            st.info(
+                f"Vse točke so znotraj meje ±3·σ₀ (±{3.0 * first_s0 * 1000.0:.3f} mm) – "
+                "nobena točka ni bila izločena."
+            )
+
+    # 2. Prikaz numeričnih rezultatov
+    k_col1, k_col2, k_col3, k_col4 = st.columns(4)
+    k_col1.metric(
+        "Aposteriorni std. odklon σ₀",
+        f"{result.sigma0 * 1000.0:.3f} mm",
+        delta=f"{result.sigma0:.6f} m",
+        delta_color="off",
+    )
+    k_col2.metric(
+        "RMSE odstopanj",
+        f"{result.rmse * 1000.0:.3f} mm",
+        delta=f"min {result.min_residual * 1000.0:+.2f} / max {result.max_residual * 1000.0:+.2f} mm",
+        delta_color="off",
+    )
+    k_col3.metric(
+        "Število iteracij",
+        f"{result.iterations}",
+        delta="Konvergiralo" if result.converged else "Ni konvergiralo",
+        delta_color="off",
+    )
+    k_col4.metric(
+        "Prostostne stopnje (n - u)",
+        format_int_sl(result.degrees_of_freedom),
+        delta=f"n = {format_int_sl(result.n_points)}, u = {result.n_unknowns}",
+        delta_color="off",
+    )
+
+    st.markdown("#### Izravnani parametri modela")
+    params_df = _build_params_dataframe(result)
+    st.dataframe(params_df, width="stretch", hide_index=True)
+
+    with st.expander("Kofaktorska matrika Q_ΔΔ", expanded=False):
+        q_labels = _get_qdd_labels(result)
+        q_df = pd.DataFrame(
+            [[f"{val:.6e}" for val in row] for row in result.Q_dd],
+            index=q_labels,
+            columns=q_labels,
+        )
+        st.dataframe(q_df, width="stretch")
+        if result.model_name == "Ravnina" and "fixed_axis" in result.extra:
+            st.caption(
+                f"Pri ravnini je bila za preprečitev singularnosti fiksirana komponenta normale "
+                f"po osi `{result.extra['fixed_axis']}` = 1.0."
+            )
+
+    # 3. 3D vizualizacija izravnanega telesa in odstopanj
+    st.markdown("#### 3D vizualizacija izravnanega telesa in odstopanj")
+    fig_3d, was_subsampled = build_adjustment_3d_figure(
+        points_used,
+        result,
+        use_local_center=use_local_center,
+        marker_size=marker_size,
+    )
+    if was_subsampled:
+        st.info(
+            f"Za odziven 3D izris je prikazan naključni podvzorec **{format_int_sl(MAX_PLOT_POINTS)}** "
+            f"od **{format_int_sl(result.n_points)}** točk. Izravnava in histogram temeljita na vseh točkah."
+        )
+    st.plotly_chart(fig_3d, width="stretch")
+
+    st.markdown("#### Histogram odstopanj (rezidualov)")
+    fig_hist = build_residuals_histogram(result)
+    st.plotly_chart(fig_hist, width="stretch")
+
+    # 4. Izvoz za poročilo
+    st.markdown("#### Izvoz rezultatov za poročilo")
+    stem = Path(source_name).stem
+    model_slug = (
+        result.model_name.lower()
+        .replace(" ", "_")
+        .replace("č", "c")
+        .replace("ž", "z")
+        .replace("š", "s")
+    )
+
+    report_bytes = _generate_report_txt(
+        source_name=source_name,
+        prep_info=st.session_state.get("preprocessing_info"),
+        volume_results=st.session_state.get("volume_results"),
+        adj_output=adj_output,
+    )
+    csv_bytes = _generate_residuals_csv(points_used, result.residuals)
+
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="Prenesi poročilo (.txt)",
+            data=report_bytes,
+            file_name=f"{stem}_porocilo_{model_slug}.txt",
+            mime="text/plain",
+            width="stretch",
+        )
+    with dl_col2:
+        st.download_button(
+            label="Prenesi odstopanja (.csv)",
+            data=csv_bytes,
+            file_name=f"{stem}_odstopanja_{model_slug}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+
 def main() -> None:
     """Glavna vstopna točka Streamlit uporabniškega vmesnika."""
     st.title("GMS Vaja 2 – Obdelava oblaka točk")
     st.caption(
-        "Predogled, predobdelava (CloudCompare orodja) in volumetrija oblakov točk, "
-        "posnetih z elektronskim tahimetrom Leica MS60 (izvoz iz Leica Infinity)."
+        "Predogled, predobdelava (CloudCompare orodja), 2.5D volumetrija in geodetska "
+        "izravnava po MNK za oblake točk Leica MS60 / Leica Infinity."
     )
 
     st.sidebar.header("1. Vir podatkov")
@@ -853,6 +1597,9 @@ def main() -> None:
         st.session_state.pop("active_source_id", None)
         st.session_state.pop("raw_points", None)
         st.session_state.pop("processed_points", None)
+        st.session_state.pop("adjustment_output", None)
+        st.session_state.pop("volume_results", None)
+        st.session_state.pop("preprocessing_info", None)
         st.info(
             "Za začetek izberite oblak točk iz mape `data/` ali pa v stranski vrstici "
             "naložite datoteko (`.pts`, `.las`, `.laz`, `.txt`, `.csv`)."
@@ -874,7 +1621,7 @@ def main() -> None:
         help=(
             "Pri velikih geodetskih koordinatah WebGL (float32) v brskalniku povzroči "
             "stopničavost izrisa. Centriranje ohrani natančno geometrijo v 3D pogledu, "
-            "medtem ko obvestilo ob miški in barvna lestvica Z vedno prikazujeta prave koordinate."
+            "medtem ko obvestilo ob miški in barvna lestvica vedno prikazujeta prave vrednosti."
         ),
     )
     marker_size = st.sidebar.slider(
@@ -912,8 +1659,12 @@ def main() -> None:
         )
 
     with tab3:
-        st.subheader("Izravnava po metodi najmanjših kvadratov (MNK)")
-        st.info("V pripravi – 3. korak")
+        _render_tab_adjustment(
+            source_name=active_source_name,
+            processed_sig=processed_sig,
+            use_local_center=use_local_center,
+            marker_size=marker_size,
+        )
 
 
 if __name__ == "__main__":
